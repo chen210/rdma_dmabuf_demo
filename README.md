@@ -30,6 +30,28 @@ sudo apt-get install -y libibverbs-dev rdma-core
 make
 ```
 
+也可以直接运行测试脚本，它会自动编译并执行基础自检：
+
+```bash
+./run_tests.sh
+```
+
+常用参数：
+
+```bash
+./run_tests.sh --device mlx5_0 --length 4096
+./run_tests.sh --drm-node /dev/dri/renderD128 --amdgpu-domain vram
+./run_tests.sh --skip-amdgpu
+```
+
+如果当前用户没有 `/dev/dri/renderD*` 权限，但你只是想临时验证 AMDGPU exporter 阶段，可以使用：
+
+```bash
+./run_tests.sh --sudo-amdgpu --drm-node /dev/dri/renderD128
+```
+
+长期更合适的做法是把当前用户加入 `render` 组后重新登录。
+
 ## 3. 普通 MR 自检
 
 先验证普通用户态内存注册是否工作：
