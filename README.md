@@ -6,13 +6,17 @@
 AMDGPU BO 或已有 dma-buf fd -> libibverbs/uverbs -> dmabuf MR -> lkey/rkey
 ```
 
+`BO` 是 `Buffer Object`，在这里指 DRM/AMDGPU 驱动管理的一块 GPU buffer。`VRAM BO` 是请求放在 `AMDGPU_GEM_DOMAIN_VRAM` 里的 AMDGPU buffer object。
+
 当前支持三种模式：
 
 - `--normal`：注册普通用户态内存，用来确认 RDMA verbs 基础环境正常。
 - `--dmabuf-fd`：注册当前进程里已经打开的 dma-buf fd。
 - `--amdgpu-drm`：通过 AMDGPU DRM UAPI 创建 GEM BO，PRIME export 成 dma-buf fd，再注册成 RDMA dmabuf MR。
 
-它还不是完整 RDMA 数据面程序：不会建 QP，不会和远端交换 `rkey/iova`，也不会验证 GPU buffer 里的 pattern。它只验证“export/register MR”这一步。
+`rdma_dmabuf_p2p_test` 是下一阶段对测程序：server 端持有 AMDGPU VRAM dmabuf MR，client 端建立 RC QP 后执行 RDMA Write/Read，并做 pattern 校验。
+
+本机排查中遇到过 `ibv_reg_dmabuf_mr()` 成功但 BO 最终落到 GTT 的情况，现象和分析见 [rdma_dmabuf_p2p_gtt_fallback_analysis.md](rdma_dmabuf_p2p_gtt_fallback_analysis.md)。后续遇到类似问题，按 [rdma_dmabuf_p2p_debug_playbook.md](rdma_dmabuf_p2p_debug_playbook.md) 的步骤建立判断链。
 
 ## 1. 依赖
 
@@ -43,6 +47,8 @@ make
 ./run_tests.sh --drm-node /dev/dri/renderD128 --amdgpu-domain vram
 ./run_tests.sh --skip-amdgpu
 ```
+
+本机实测时 Mellanox/RoCE 设备名不是 `mlx5_0`，而是 `rocep1s0f0`。先用 `ibv_devices` 或 `ibv_devinfo -l` 看真实 verbs 设备名。
 
 如果当前用户没有 `/dev/dri/renderD*` 权限，但你只是想临时验证 AMDGPU exporter 阶段，可以使用：
 
@@ -113,7 +119,118 @@ rkey=...
 
 这还不等于已经证明真实 VRAM P2P。下一步还要做 RDMA Write/Read 数据正确性验证，并确认路径没有退回 system memory/GTT。
 
-## 7. 常见失败
+## 7. 本机实测记录
+
+2026-06-20 在当前机器上执行：
+
+```bash
+./run_tests.sh --device rocep1s0f0 --length 4096 \
+  --drm-node /dev/dri/renderD128 --amdgpu-domain vram
+```
+
+关键结果：
+
+```text
+ibv_devinfo -d rocep1s0f0
+  state: PORT_ACTIVE
+  link_layer: Ethernet
+
+normal MR registered
+addr=... length=4096 lkey=0x2604 rkey=0x2604
+
+amdgpu BO exported as dma-buf
+drm_node=/dev/dri/renderD128 gem_handle=1 dmabuf_fd=6 length=4096 domain=0x4 flags=0x0
+
+dmabuf MR registered
+fd=6 offset=0 length=4096 iova=0x0 lkey=0x2604 rkey=0x2604
+
+failures=0 warnings=0 skips=0
+```
+
+这说明当前机器已经打通这些前置链路：
+
+- `rocep1s0f0` 可用于 verbs MR 注册；
+- normal MR 注册成功，基础 RDMA 用户态环境正常；
+- `/dev/dri/renderD128` 是 `amdgpu`；
+- AMDGPU 可以创建 `domain=0x4` 的 VRAM BO；
+- 这个 VRAM BO 可以 PRIME export 成 dma-buf fd；
+- `ibv_reg_dmabuf_mr()` 可以把该 dma-buf fd 注册成 RDMA MR；
+- MR 创建成功并返回 `lkey/rkey`，访问权限包含本地写、远端读和远端写。
+
+边界也要记清楚：当前程序注册成功后就注销 MR，不建 QP，不交换 `rkey/iova`，也不发 RDMA Write/Read。因此这次结果证明“GPU VRAM BO 可以作为 dma-buf 注册成 RDMA MR”，但还不能单独证明 RNIC 已经对 GPU VRAM 完成真实 P2P 数据访问。
+
+## 8. P2P 对测程序
+
+`rdma_dmabuf_p2p_test` 做这些事：
+
+```text
+server:
+  AMDGPU VRAM BO
+  -> PRIME export dma-buf
+  -> ibv_reg_dmabuf_mr(iova=0)
+  -> 创建 RC QP
+  -> 通过 TCP 交换 qpn/psn/gid/rkey/iova
+  -> 等 client RDMA Write/Read
+  -> mmap AMDGPU BO 校验 pattern
+
+client:
+  注册普通用户态 MR
+  -> 填充 pattern
+  -> 创建 RC QP
+  -> RDMA Write 到 server 的 dmabuf MR
+  -> RDMA Read 从 server 的 dmabuf MR 读回
+  -> 校验读回 pattern
+```
+
+server 端，也就是 GPU/RDMA target 机器：
+
+```bash
+sudo ./rdma_dmabuf_p2p_test \
+  --server \
+  --device rocep1s0f0 \
+  --ib-port 1 \
+  --gid-index 3 \
+  --drm-node /dev/dri/renderD128 \
+  --length 4096
+```
+
+client 端，也就是发起 RDMA Write/Read 的机器：
+
+```bash
+./rdma_dmabuf_p2p_test \
+  --client <server_ip> \
+  --device <client_rdma_dev> \
+  --ib-port 1 \
+  --gid-index <client_roce_v2_gid_index> \
+  --length 4096
+```
+
+如果 server 端当前用户已经加入 `render` 组并重新登录，可以不加 `sudo`。否则打开 `/dev/dri/renderD128` 会失败。
+
+默认 server 端创建 `AMDGPU_GEM_DOMAIN_VRAM` BO，并带 `AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED`，这样测试结束后可以 mmap BO 做 CPU 侧 pattern 校验。可以用 `--amdgpu-flags 0` 改回无额外 flag 的创建方式，但某些离散显卡的 VRAM BO 可能不能 CPU mmap，server 端校验会失败；这时可以临时加 `--skip-mmap-verify`，但那只能证明 RDMA Read 回读一致，不能证明 CPU/GPU 可见内容校验也通过。
+
+2026-06-20 本机双进程自回环实测通过：
+
+```text
+server:
+dmabuf MR registered: fd=6 iova=0x0 length=4096 lkey=0x2605 rkey=0x2605
+server listening on tcp port 18516
+client connected on control socket
+qp connected: local_qpn=137 remote_qpn=138 remote_rkey=0x2706 remote_vaddr=0xaaaad1d51000
+server amdgpu BO mmap pattern verify passed, length=4096 seed=0x5a
+server p2p target test passed
+
+client:
+qp connected: local_qpn=138 remote_qpn=137 remote_rkey=0x2605 remote_vaddr=0x0
+RDMA_WRITE completion passed
+RDMA_READ completion passed
+client RDMA_READ back pattern verify passed, length=4096 seed=0x5a
+client p2p initiator test passed
+```
+
+这比前面的 MR smoke test 多证明了：QP 建链、远端 `rkey/iova` 交换、RDMA Write、RDMA Read、client 回读校验、server 端 BO mmap 校验都能通过。若要证明跨机器 RoCE 数据面，需要把 client 放到另一台同网段 RoCE 机器上跑同一条 client 命令。
+
+## 9. 常见失败
 
 - `missing /usr/include/infiniband/verbs.h`：安装 `libibverbs-dev`。
 - `ibv_reg_dmabuf_mr symbol not found`：当前 rdma-core/libibverbs 太旧，或发行版没有暴露该 API。
@@ -124,8 +241,10 @@ rkey=...
 - `DRM_IOCTL_AMDGPU_GEM_CREATE failed`：不是 AMDGPU render node、domain 不支持、显存不足，或权限/驱动状态不满足。
 - `DRM_IOCTL_PRIME_HANDLE_TO_FD failed`：BO 不能 PRIME export，或 DRM 节点不支持该导出路径。
 - `ibv_reg_dmabuf_mr failed`：dma-buf fd 无效、长度/offset 不合法、GPU exporter 不支持 attach/map、provider/IOMMU/topology 不支持。
+- `RDMA_WRITE` 或 `RDMA_READ` completion failed：优先检查两端 GID index、RoCE IP 可达性、MTU、PFC/ECN、rkey/iova 交换是否一致。
+- server 端 `mmap amdgpu BO` 失败：VRAM BO 可能不在 CPU visible 区域，先用默认 `AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED`，或临时加 `--skip-mmap-verify` 缩小问题。
 
-## 8. 后续扩展
+## 10. 后续扩展
 
 后续要把 MR 注册扩展成完整 RDMA 数据面：
 

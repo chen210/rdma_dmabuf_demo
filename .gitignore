@@ -1,2 +1,3 @@
 rdma_dmabuf_mr_demo
+rdma_dmabuf_p2p_test
 *.o
