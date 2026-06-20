@@ -1,0 +1,77 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Trace AMDGPU dma-buf mapping placement.
+ *
+ * Requires root and BTF for core dma-buf structs. This version deliberately
+ * avoids DRM/AMDGPU private structs because distro kernels often do not expose
+ * module-private BTF for struct drm_gem_object or struct amdgpu_bo.
+ *
+ * It identifies the placement branch taken inside amdgpu_dma_buf_map():
+ *   drm_prime_pages_to_sg()       -> TTM_PL_TT   -> GTT/system memory
+ *   amdgpu_vram_mgr_alloc_sgt()   -> TTM_PL_VRAM -> VRAM
+ */
+
+BEGIN
+{
+	printf("Tracing amdgpu_dma_buf_map(). branch 2=GTT, 3=VRAM. Ctrl-C to stop.\n");
+}
+
+kprobe:amdgpu_dma_buf_map
+{
+	$attach = (struct dma_buf_attachment *)arg0;
+	$dmabuf = $attach->dmabuf;
+
+	@dmabuf[tid] = $dmabuf;
+	@ino[tid] = $dmabuf->file->f_inode->i_ino;
+	@size[tid] = $dmabuf->size;
+	@peer2peer[tid] = $attach->peer2peer;
+	@dev[tid] = $attach->dev;
+	@branch[tid] = 0;
+}
+
+kprobe:drm_prime_pages_to_sg
+/@dmabuf[tid]/
+{
+	@branch[tid] = 2;
+}
+
+kprobe:amdgpu_vram_mgr_alloc_sgt
+/@dmabuf[tid]/
+{
+	@branch[tid] = 3;
+}
+
+kretprobe:amdgpu_dma_buf_map
+/@dmabuf[tid]/
+{
+	$dev = (struct device *)@dev[tid];
+
+	if (@branch[tid] == 3) {
+		printf("amdgpu_dma_buf_map ret=%p ino=%lu size=%lu dev=%s peer2peer=%d branch=3 placement=VRAM\n",
+		       retval, @ino[tid], @size[tid], str($dev->kobj.name), @peer2peer[tid]);
+	} else if (@branch[tid] == 2) {
+		printf("amdgpu_dma_buf_map ret=%p ino=%lu size=%lu dev=%s peer2peer=%d branch=2 placement=GTT\n",
+		       retval, @ino[tid], @size[tid], str($dev->kobj.name), @peer2peer[tid]);
+	} else {
+		printf("amdgpu_dma_buf_map ret=%p ino=%lu size=%lu dev=%s peer2peer=%d branch=0 placement=UNKNOWN\n",
+		       retval, @ino[tid], @size[tid], str($dev->kobj.name), @peer2peer[tid]);
+	}
+
+	delete(@dmabuf[tid]);
+	delete(@ino[tid]);
+	delete(@size[tid]);
+	delete(@peer2peer[tid]);
+	delete(@dev[tid]);
+	delete(@branch[tid]);
+}
+
+END
+{
+	clear(@dmabuf);
+	clear(@ino);
+	clear(@size);
+	clear(@peer2peer);
+	clear(@dev);
+	clear(@branch);
+}
